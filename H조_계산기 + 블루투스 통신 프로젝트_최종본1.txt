@@ -1,0 +1,397 @@
+//계산기 + 블루투스 통신 프로젝트
+#define F_CPU 16000000UL
+#define __DELAY_BACKWARD_COMPATIBLE__
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/delay.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>  // 문자열 확인을 위한 헤더 추가
+
+//-------------------mario buzzer define--------------------------
+#define C4  261
+#define D4  294
+#define E4  330
+#define F4  349
+#define G4  392
+#define A4  440
+#define B4  494
+#define C5  523
+#define D5  587
+#define E5  659
+#define F5  698
+#define G5  784
+#define A5  880
+#define B5  988
+//--------------------------------------------------------------------
+//------------------global variables--------------------------------
+unsigned char data[10]={0x3f,0x06,0x5b,0x4f,0x66,0x6d,0x7d,0x07,0x7f,0x6f}; //FND 숫자 표시 배열
+unsigned char sel[4]={0x08, 0x04, 0x02, 0x01}; //FND SELL
+unsigned char phone_num[2][13] = {{0,1,0,10,1,1,1,1,10,1,1,1,1},{0,1,0,10,1,2,3,4,10,5,6,7,8}};	//AN OH PHONE NUMBER 2차원 배열
+unsigned char digit_num[11]={0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f, 0x40};	//전화번호 출력용 숫자배열
+unsigned char led[8]={0x01, 0x02, 0x04, 0x08, 0x10, 0x020, 0x40, 0x80};							//8BIT LED 배열
+
+volatile char click=0;   //sel 자리 설정 하는 click
+volatile int input=0;    //각 sel에 들어갈 숫자
+volatile int unit[4]={0,0,0,0}; //각 sel에 들어갈 수치 저장 배열
+volatile int sum=0;   //unit==sel에 들어있는 숫자들의 합 ex) 1 1 3 1 == 1131숫자가 되게 함.
+volatile int result=0, op=0;   //sum값을 result와 op에 각각 저장할 것임.
+volatile int count=0; //연산횟수
+volatile int num_index=0;	//제작자 1, 2 id 구분해서 전화번호 출력
+volatile int buz_hz1=0, buz_hz2=0;
+volatile int buz_cnt1=0, buz_cnt2=0;
+volatile int buz_sum_cnt=0;
+volatile int buz_delay=0;
+volatile int num_bluetooth=0;
+
+//------------------------함수 선언부--------------------------------
+
+//-------------------계산기 관련 함수---------------------------------
+void display(int);      //입력 수 display
+void display_operation(int);   //연산 결과 display
+void display_error(void); //0~9999 수치범위 오버할 경우
+void buzzer0(int,int, int, int, int, int);
+void buzzer1(int, int);
+void window_stop();
+void mario_song();
+void window_start();
+//-----------------블루투스 통신 결과 관련 함수------------------------
+void display_creator_phonenumber(int);
+void display_creator_credit(void);
+
+//----------------블루투스 통신 세팅 관련 함수-------------------------
+void Init_USART0(void);
+void putch_USART0(unsigned char);
+unsigned char getch_USART0(void);
+void get_string_USART0(char *, int);
+
+//------------------------------사칙연산 인터럽트---------------------
+ISR(INT0_vect){
+	result = result + op;
+	count++;
+}
+ISR(INT1_vect){
+	result = result - op;
+	count++;
+}
+ISR(INT2_vect){
+	result = result * op;
+	count++;
+}
+ISR(INT3_vect){
+	result = result / op;
+	count++;
+}
+//------------------------------숫자세팅 인터럽트----------------------
+ISR(INT4_vect){
+	input = (input+1)%10;
+	_delay_ms(30);
+}
+ISR(INT5_vect){
+	click = (click+1)%4;
+	input=0;			//loop 설정 => 1의 자리 설정을 다시 할 시 0으로 세팅
+	_delay_ms(30);
+}
+//-------------------result, operand저장 인터럽트--------------------
+ISR(INT6_vect){
+	result = result + sum;
+	PORTA = 0xf0;   _delay_ms(1000);
+	
+}
+ISR(INT7_vect){
+	op = sum;
+	PORTA = 0x0f;   _delay_ms(1000);
+	
+}
+//-------------------------------USART통신 세팅-------------------
+void Init_USART0(void){
+	UCSR0A = 0x00;
+	UCSR0B = 0x18;  // RXEN0(수신기 활성화)와 TXEN0(송신기 활성화)를 설정
+	UCSR0C = 0x06;  // 비동기 모드, 패리티 비트 없음, 1 스톱 비트, 8 비트 데이터
+	UBRR0H = 0x00;   // 데이터 사용 bit 예약 , 011
+	UBRR0L = 0x67;  // 16MHz에서 9600bps 설정 (103을 16진수로 표현)
+}
+
+void putch_USART0(unsigned char c){
+	while(!(UCSR0A & (1<<UDRE0)));  // 데이터 레지스터가 비어있을 때까지 대기
+	UDR0 = c;  // 데이터를 전송
+}
+
+unsigned char getch_USART0(void){
+	while(!(UCSR0A & (1<<RXC0)));  // 데이터 수신 완료를 기다림
+	return UDR0;  // 수신된 데이터를 반환
+}
+
+void get_string_USART0(char *str, int max_length){	//bluetooth app, 터미널 입력 지원 함수
+	int i = 0;
+	unsigned char c;
+	while (i < max_length - 1) {
+		c = getch_USART0();
+		if (c == '\@') {  // 무조건 space를 해야 입력을 인식받음
+			break;
+		}
+		str[i++] = c;
+	}
+	str[i] = '\0';  // 문자열 종료 문자
+}
+
+//---------------------------------------------------------------------
+int main(void){
+	DDRC = 0xff;//fnd data 신호 출력
+	DDRG = 0x0f; //fnd sel 신호 출력
+	DDRE = 0x0f;// 0b0000 1111 pe4~7 sw1,2,3,4 interrupt
+	DDRD = 0xf0;// 0b1111 0000 pd0~3 sw5,6,7,8 interrupt
+	DDRA = 0xff;//led all 출력
+	DDRB = 0x10;//buzzer 출력
+	EICRA = 0b10101010; // ext interrupt 0~3 falling edge
+	EICRB = 0b10101010; // ext interrupt 4~7 falling edge
+	EIMSK = 0xff; // ext interrupt all enable
+	SREG|=0x80;
+	
+	char in[50];  // 입력을 저장할 버퍼
+	//---------------------------------------------
+	//START!
+	//----------------------------------------------
+	window_start();	//부저시작음
+	
+	while (1){
+		if(((result>=0)&&(result<=9999))&&((op>=0)&&(op<=9999))){
+			if((PIND & 0x01)==0x00){   PORTA = 0x80; display_operation(result); }	//덧셈결과fnd출력 및 led자리 주목!
+			if((PIND & 0x02)==0x00){   PORTA = 0x40; display_operation(result); }	//뺄셈
+			if((PIND & 0x04)==0x00){   PORTA = 0x20; display_operation(result); }	//곱셈
+			if((PIND & 0x08)==0x00){   PORTA = 0x10; display_operation(result); }	//나눗셈
+			if((PINE & 0x05)==0x00){	//5번sw를 누르는 click수에 의해서 각 자릿수 변경할 수 있음.
+				if(click == 0){
+					unit[3] = input; PORTA = 0x01;
+					unit[0]=0; unit[1]=0; unit[2]=0;
+				}
+				if(click == 1){
+					unit[2] = input; PORTA = 0x02;
+					unit[0]=0; unit[1]=0;
+				}
+				if(click == 2){
+					unit[1] = input; PORTA = 0x04;
+					unit[0]=0;
+				}
+				if(click == 3){
+					unit[0] = input; PORTA = 0x08;
+				}
+				sum = (unit[0]*1000) + (unit[1]*100) + (unit[2]*10) + unit[3];
+				display(sum);
+			}
+			if( op == 9999 ){		//탈출key => bluetooth 통신가능 + 계산기 기능 정지
+				Init_USART0();
+				get_string_USART0(in, sizeof(in));  // 문자열을 수신
+				if (strcmp(in, "result") == 0) {
+					PORTA = 0xff; display_operation(result);
+					buzzer0(480, 320, 240, 180, 1, 1000);
+				}
+				else if (strcmp(in, "phone1") == 0) {   //광진번호출력
+					buzzer0(480, 320, 12, 8, 20, 2000);
+					num_index=0;
+					PORTA = 0x0f; display_creator_phonenumber(num_index);
+				}
+				else if (strcmp(in, "phone2") == 0) {   //지민번호출력
+					buzzer0(480, 320, 12, 8, 20, 2000);
+					num_index=1;
+					PORTA = 0xf0; display_creator_phonenumber(num_index);
+				}
+				else if (strcmp(in, "name") == 0) {		//제작자 이름 An.Oh.출력
+					PORTA = 0x00;
+					display_creator_credit();
+					buzzer0(480, 320, 240, 180, 1, 1000);
+				}
+				else if (strcmp(in, "count") == 0) {	//계산횟수 출력
+					PORTA = 0x00;
+					display(count);   _delay_ms(1000);
+					buzzer0(480, 320, 240, 180, 1, 1000);
+				}
+				else if (strcmp(in, "music") == 0) {	//계산횟수 출력
+					PORTA=0xff;
+					mario_song();
+				}
+				//else if (isdigit(in[0])) { // 숫자 입력 처리
+					//int num = atoi(in); // 문자열을 숫자로 변환
+					//result += num; // 숫자를 result에 더함
+					//PORTA = 0xff; display_operation(result);
+					//buzzer0(480, 320, 240, 180, 1, 1000);
+				//}
+				else if ((isdigit(in[1]) && in[0] == '+') || (in[0] == '-' && isdigit(in[1])) || (in[0] == '*' && isdigit(in[1])) || (in[0] == '/' && isdigit(in[1]))) { // 숫자 또는 연산 기호 입력 처리
+					//num_bluetooth = atoi(in); // 문자열을 숫자로 변환
+					if (in[0] == '+') {
+						num_bluetooth = atoi(in); // 문자열을 숫자로 변환
+						result +=  num_bluetooth; // 숫자를 result에 더함
+					}
+					else if (in[0] == '-') {
+						num_bluetooth = -atoi(in+1); // 문자열을 숫자로 변환
+						result +=  num_bluetooth; // 숫자를 result에 더함
+					}
+					else if (in[0] == '*') {
+						num_bluetooth = atoi(in+1); // 문자열을 숫자로 변환
+						result *=  num_bluetooth; // 숫자를 result에 더함
+					}
+					else if (in[0] == '/') {
+						num_bluetooth = atoi(in+1); // 문자열을 숫자로 변환
+						result /=  num_bluetooth; // 숫자를 result에 더함
+					}
+					//else {
+						//num_bluetooth = atoi(in);
+						//result = num_bluetooth; // 숫자를 result에 할당
+					//}
+					PORTA = 0xff; display_operation(result);
+					buzzer0(480, 320, 240, 180, 1, 1000);
+				}
+				else {
+					PORTA=0x00; 
+				}
+			}
+		}
+		else {
+			display_error();//0~9999 동작법위 벗어남
+			window_stop();
+			PORTB=0x00;
+		}
+	}
+}
+
+//---------     buzzer time------------------
+void buzzer0(buz_hz1,buz_hz2, buz_cnt1, buz_cnt2, buz_sum_cnt, buz_delay){
+	for(int i=0; i<buz_sum_cnt; i++){
+		buzzer1(buz_hz1,buz_cnt1);
+		buzzer1(buz_hz2,buz_cnt2);
+	}_delay_ms(buz_delay);
+}
+
+void buzzer1(int hz, int count){
+	int i=0;
+	double ms=500.00/hz;
+	for(i=0; i<count; i++){
+		PORTB = 0x10;	_delay_ms(ms);
+		PORTB = 0x00;	_delay_ms(ms);
+	}
+}
+void window_start(){	//동작시작음
+	buzzer0(1046, 1046, 8, 8, 10, 200);	//도
+	buzzer0(1318, 1318, 8, 8, 10, 200);	//미
+	buzzer0(1568, 1568, 8, 8, 10, 200);	//솔
+	buzzer0(1046*2, 1046*2, 8, 8, 10, 200);	//+도
+	PORTB=0x00;
+}
+void window_stop(){
+	buzzer0(2093*2, 2093*2, 8, 8, 10, 200); //+도 솔 미 도 - 윈도우 종료음 표방
+	buzzer0(1568*2, 1568*2, 8, 8, 16, 200);
+	buzzer0(1318, 1318, 8, 8, 10, 200);
+	buzzer0(1046, 1046, 8, 8, 16, 200);
+	PORTB=0x00; _delay_ms(100000);
+}
+void mario_song(){
+	// Section 1: E E E C E G G
+	buzzer0(E5, E5, 8, 8, 1, 150); // E
+	buzzer0(E5, E5, 8, 8, 1, 150); // E
+	buzzer0(E5, E5, 8, 8, 1, 150); // E
+	buzzer0(C5, C5, 8, 8, 1, 300); // C
+	buzzer0(E5, E5, 8, 8, 1, 150); // E
+	buzzer0(G5, G5, 8, 8, 1, 400); // G
+	buzzer0(G4, G4, 8, 8, 1, 400); // G (lower)
+
+	// Section 2: C G E A B - B A G
+	buzzer0(C5, C5, 8, 8, 1, 400); // C
+	buzzer0(G4, G4, 8, 8, 1, 400); // G
+	buzzer0(E4, E4, 8, 8, 1, 500); // E
+	buzzer0(A4, A4, 8, 8, 1, 200); // A
+	buzzer0(B4, B4, 8, 8, 1, 200); // B
+	buzzer0(A4, A4, 8, 8, 1, 200); // A (lower)
+	buzzer0(G4, G4, 8, 8, 1, 500); // G (lower)
+
+	// Section 3: E G A F G E C D B
+	buzzer0(E5, E5, 8, 8, 1, 400); // E
+	buzzer0(G5, G5, 8, 8, 1, 200); // G
+	buzzer0(A5, A5, 8, 8, 1, 200); // A
+	buzzer0(F5, F5, 8, 8, 1, 200); // F
+	buzzer0(G5, G5, 8, 8, 1, 200); // G
+	buzzer0(E5, E5, 8, 8, 1, 300); // E
+	buzzer0(C5, C5, 8, 8, 1, 200); // C
+	buzzer0(D5, D5, 8, 8, 1, 200); // D
+	buzzer0(B4, B4, 8, 8, 1, 400); // B
+	
+}
+
+//-----------------------display time---------------------------------
+void display(int sum){
+	int i=0, fnd[4];
+	fnd[0]=(sum/1000)%10;
+	fnd[1]=(sum/100)%10;
+	fnd[2]=(sum/10)%10;
+	fnd[3]=(sum/1)%10;
+	for(i=0; i<4; i++){
+		PORTG = sel[i];
+		PORTC = data[fnd[i]];
+		_delay_ms(4);
+	}
+}
+
+void display_operation(int sum){
+	int i=0, t=0, fnd[4];
+	fnd[0]=(sum/1000)%10;
+	fnd[1]=(sum/100)%10;
+	fnd[2]=(sum/10)%10;
+	fnd[3]=(sum/1)%10;
+	for(t=0; t<100; t++){
+		for(i=0 ; i<4; i++){
+			PORTG = sel[i];
+			PORTC = data[fnd[i]];
+			_delay_ms(5);
+		}
+	}
+}
+
+void display_error(void){	//에러모드
+	int t=0;
+	for(t=0; t<20; t++){
+		PORTG = 0x04; PORTC = 0x79; _delay_ms(5);
+		PORTG = 0x02; PORTC = 0b01010000; _delay_ms(5);
+		PORTG = 0x01; PORTC = 0b01010000; _delay_ms(5);
+	}PORTG=0x00;
+}
+
+void display_creator_phonenumber(int index){	//전화번호 오른쪽에서 왼쪽으로 이동하면서 번호보이기
+	for(int i=0; i<16; i++){
+		for(int t=0; t<50; t++){
+			if(i<13){
+				PORTG = 0x01;
+				PORTC = digit_num[phone_num[index][i]];
+			}_delay_ms(2.5);
+			if(i>=1 && i<14){
+				PORTG = 0x02;
+				PORTC = digit_num[phone_num[index][i-1]];
+			}_delay_ms(2.5);
+			if(i>=2 && i<15){
+				PORTG = 0x04;
+				PORTC = digit_num[phone_num[index][i-2]];
+			}_delay_ms(1.5);
+			if(i>=3 && i<16){
+				PORTG = 0x08;
+				PORTC = digit_num[phone_num[index][i-3]];
+			}_delay_ms(1.5);
+		}PORTG=0x00;
+	}
+}
+
+void display_creator_credit(void){	//이름 출력
+	int t=0;
+	for(t=0; t<200; t++){
+		PORTG = 0x08; PORTC = 0b01110111; _delay_ms(5);
+		PORTG = 0x04; PORTC = 0b11010100; _delay_ms(5);
+		PORTG = 0x02; PORTC = 0b00111111; _delay_ms(5);
+		PORTG = 0x01; PORTC = 0b11110100; _delay_ms(5);
+	}PORTG=0x00;
+}
+//A 11101110 0~7bit순서
+//n 00101011
+//O 11111100
+//h 00101111
+
+
+//---------------project end------------------------
+// CALCULATOR + BLUETOOTH USART
+//BUZZER + INTERRUPT + LED + FND
